@@ -1,4 +1,2 @@
-selenium
-webdriver-manager
-requests
-pandas
+casabourse>=0.1.0
+pandas>=2.0.0
