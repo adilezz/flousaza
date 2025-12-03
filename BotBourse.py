@@ -150,72 +150,79 @@ def save_history(
     conn.commit()
     return inserted
 
-
 def update_daily_data(max_instruments: int | None = None) -> int:
-    """
-    Met à jour historical_quotes avec les nouvelles séances via casabourse.
 
-    - Cherche la dernière Date présente dans historical_quotes.
-    - Pour chaque instrument en base, appelle casabourse.get_historical_data_auto
-      sur l'intervalle [dernière_date+1, aujourd'hui].
-    - Insère / remplace les lignes dans historical_quotes via save_history().
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    Retourne le nombre total de lignes ajoutées/mises à jour.
-    """
-    # Avant toute chose, on s'assure que la table instruments est synchro
+def process_instrument_update(inst, start_s, end_s, conn_check=None):
+    """Fonction helper pour traiter un seul instrument (pour le parallélisme)"""
+    sym = inst["symbol"]
+    instrument_id = inst["id"]
+    try:
+        # On utilise une nouvelle connexion par thread car sqlite3 n'est pas thread-safe par défaut
+        # sauf si on gère bien les curseurs, mais ici il vaut mieux ouvrir/fermer vite.
+        # Note: Pour l'insertion, on renverra les données au main thread ou on utilisera un lock.
+        # Ici, pour simplifier, on récupère juste le DF et on l'insérera dans le main thread.
+        
+        print(f"🔄 Traitement {sym}...")
+        df = cb.get_historical_data_auto(sym, start_s, end_s)
+        
+        if df is None or df.empty:
+            return None
+            
+        if "Date" not in df.columns:
+            return None
+            
+        df["Date"] = pd.to_datetime(df["Date"]).dt.strftime("%Y-%m-%d")
+        df.insert(0, "Symbol", sym)
+        return (instrument_id, df)
+        
+    except Exception as exc:
+        print(f"❌ Erreur {sym}: {exc}")
+        return None
+
+def update_daily_data(max_instruments=None): # Retrait du typage 3.10 pour compatibilité
     sync_instruments_from_casabourse()
-
+    
     last_date = get_latest_session_date()
+    # ... (logique de date identique au code original) ...
     if last_date:
         start_dt = datetime.datetime.strptime(last_date, "%Y-%m-%d").date() + timedelta(days=1)
     else:
-        # Si aucune date, on ne fait rien ici (la base doit être initialisée par scraper.py)
-        print("⚠️ Aucune date existante dans historical_quotes, aucune mise à jour quotidienne effectuée.")
+        print("⚠️ Base vide, initialisation nécessaire.")
         return 0
 
     today = date.today()
     if start_dt > today:
-        print(f"ℹ️ Aucune nouvelle séance à récupérer (dernière date = {last_date}).")
+        print(f"ℹ️ À jour.")
         return 0
 
     start_s = start_dt.strftime("%Y-%m-%d")
     end_s = today.strftime("%Y-%m-%d")
-    print(f"🔄 Mise à jour quotidienne des données de {start_s} à {end_s}...")
-
+    
     instruments = get_instruments_from_db()
-    if max_instruments is not None:
-        instruments = instruments[:max_instruments]
+    if max_instruments: instruments = instruments[:max_instruments]
 
-    conn = sqlite3.connect(DB_NAME)
     total_rows = 0
-    try:
-        for idx, inst in enumerate(instruments, start=1):
-            sym = inst["symbol"]
-            instrument_id = inst["id"]
-            print(f"  ▶️ [{idx}/{len(instruments)}] Mise à jour de {sym}...")
-            try:
-                df = cb.get_historical_data_auto(sym, start_s, end_s)
-                if df is None or df.empty:
-                    continue
-                if "Date" not in df.columns:
-                    # casabourse devrait renvoyer une colonne Date; si ce n'est pas le cas on ignore
-                    continue
-                # Normalisation du format de date
-                df["Date"] = pd.to_datetime(df["Date"]).dt.strftime("%Y-%m-%d")
-                # On ajoute une colonne Symbol pour être cohérent avec save_history()
-                df.insert(0, "Symbol", sym)
-                rows = save_history(conn, instrument_id, df)
+    conn = sqlite3.connect(DB_NAME) # Connexion unique pour l'écriture
+    
+    # --- PARALLÉLISME ICI ---
+    print(f"🚀 Lancement de la mise à jour parallèle sur {len(instruments)} instruments...")
+    
+    with ThreadPoolExecutor(max_workers=5) as executor: # 5 requêtes simultanées
+        futures = {executor.submit(process_instrument_update, inst, start_s, end_s): inst for inst in instruments}
+        
+        for future in as_completed(futures):
+            result = future.result()
+            if result:
+                inst_id, df = result
+                # L'écriture en base se fait séquentiellement pour éviter les verrous (database locked)
+                rows = save_history(conn, inst_id, df)
                 total_rows += rows
-            except Exception as exc:  # noqa: BLE001
-                print(f"❌ Erreur lors de la mise à jour de {sym}: {exc}")
-    finally:
-        conn.close()
+                print(f"✅ {df['Symbol'].iloc[0]}: {rows} lignes ajoutées.")
 
-    print(f"✅ Mise à jour quotidienne terminée, {total_rows} lignes insérées/mises à jour.")
-    return total_rows
-
-
-def get_history(symbol, limit=60):
+    conn.close()
+    return total_rowsdef get_history(symbol, limit=60):
     """Récupère l'historique pour l'analyse technique depuis historical_quotes."""
     conn = sqlite3.connect(DB_NAME)
     query = """
@@ -342,30 +349,52 @@ def analyze_opportunities():
 
 # --- MODULE 3: NOTIFICATION ---
 def send_telegram(lines):
-    if not lines:
-        print("Rien à signaler aujourd'hui.")
-        return
-        
+def send_telegram(lines):
+    # 1. Toujours afficher dans les logs (console) au cas où Telegram échoue
     header = f"📅 **ANALYSE BOURSE CASA - {datetime.date.today()}**\n\n"
-    # Telegram a une limite de 4096 caractères, on découpe si besoin
     full_msg = header + "\n------------------\n".join(lines)
-    
-    if not BOT_TOKEN or not CHAT_ID:
-        print("⚠️ Pas de config Telegram, affichage console uniquement:")
-        print(full_msg)
+    print("📢 --- CONTENU DU RAPPORT ---")
+    print(full_msg)
+    print("-----------------------------")
+
+    if not lines:
         return
 
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": full_msg, "parse_mode": "Markdown"}
-    try:
-        r = requests.post(url, json=payload)
-        if r.status_code == 200:
-            print("✅ Rapport envoyé sur Telegram.")
-        else:
-            print(f"⚠️ Erreur Telegram: {r.text}")
-    except Exception as e:
-        print(f"Erreur connexion Telegram: {e}")
+    if not BOT_TOKEN or not CHAT_ID:
+        print("⚠️ Pas de config Telegram.")
+        return
 
+    # 2. Découpage intelligent (Chunking)
+    MAX_LENGTH = 4000 # Marge de sécurité (limite 4096)
+    
+    messages_to_send = []
+    current_chunk = header
+    
+    for line in lines:
+        entry = f"\n------------------\n{line}"
+        if len(current_chunk) + len(entry) > MAX_LENGTH:
+            messages_to_send.append(current_chunk)
+            current_chunk = entry
+        else:
+            current_chunk += entry
+    
+    if current_chunk:
+        messages_to_send.append(current_chunk)
+
+    # 3. Envoi séquentiel
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    
+    for i, msg in enumerate(messages_to_send):
+        payload = {"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"}
+        try:
+            r = requests.post(url, json=payload)
+            if r.status_code != 200:
+                print(f"⚠️ Erreur Telegram (Partie {i+1}): {r.text}")
+                # Tentative sans Markdown si erreur de formatage
+                payload["parse_mode"] = ""
+                requests.post(url, json=payload)
+        except Exception as e:
+            print(f"❌ Exception Telegram: {e}")
 def main():
     """
     Point d'entrée :
