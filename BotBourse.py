@@ -1,139 +1,241 @@
 import os
 import sqlite3
 import datetime
-import time
+from datetime import date, timedelta
 import pandas as pd
 import requests
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from webdriver_manager.chrome import ChromeDriverManager
+
+import casabourse as cb  # type: ignore
 
 # --- CONFIGURATION ---
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
-URL_OFFICIELLE = "https://www.casablanca-bourse.com/fr/live-market/marche-actions-groupement"
+# Base de données centralisée
 DB_NAME = "bourse_casa.db"
 MIN_VOLUME_MAD = 10000  # On ignore les actions avec moins de 10k MAD de volume jour
 
-# --- MODULE 1: GESTION DE DONNÉES (DATABASE) ---
-def init_db():
-    """Crée la base de données locale pour l'historique."""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS market_data (
-            date TEXT,
-            symbol TEXT,
-            close REAL,
-            volume_mad REAL,
-            PRIMARY KEY (date, symbol)
-        )
-    ''')
-    conn.commit()
-    conn.close()
 
-def save_daily_data(data_list):
-    """Sauvegarde les données du jour en base."""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    today = datetime.date.today().isoformat()
-    
-    count = 0
-    for item in data_list:
-        try:
-            cursor.execute('''
-                INSERT OR REPLACE INTO market_data (date, symbol, close, volume_mad)
-                VALUES (?, ?, ?, ?)
-            ''', (today, item['symbol'], item['close'], item['volume']))
-            count += 1
-        except Exception as e:
-            print(f"❌ Erreur DB sur {item['symbol']}: {e}")
-            
-    conn.commit()
-    conn.close()
-    print(f"💾 {count} entrées sauvegardées/mises à jour en base de données.")
-
-def get_history(symbol, limit=60):
-    """Récupère l'historique pour l'analyse technique."""
-    conn = sqlite3.connect(DB_NAME)
-    df = pd.read_sql_query(f"SELECT date, close FROM market_data WHERE symbol = ? ORDER BY date ASC LIMIT {limit}", conn, params=(symbol,))
-    conn.close()
-    return df
-
-# --- MODULE 2: SCRAPING (INGESTION) ---
+# --- MODULE 1: OUTILS NUMÉRIQUES & ACCÈS DB ---
 def clean_number(txt):
     if not txt: return 0.0
     clean = txt.replace(' ', '').replace('%', '').replace(',', '.')
     if '--' in clean or clean in ['-', '']: return 0.0
     try:
         return float(clean)
-    except:
+    except Exception:
         return 0.0
 
-def scrape_market():
-    print("🚀 Démarrage du scraping...")
-    
-    chrome_options = Options()
-    chrome_options.add_argument("--headless") 
-    chrome_options.add_argument("--no-sandbox")
-    chrome_options.add_argument("--disable-dev-shm-usage")
-    chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
-    
-    service = Service(ChromeDriverManager().install())
-    driver = webdriver.Chrome(service=service, options=chrome_options)
-    
-    data_extracted = []
-    
-    try:
-        driver.get(URL_OFFICIELLE)
-        wait = WebDriverWait(driver, 30)
-        wait.until(EC.presence_of_element_located((By.TAG_NAME, "tbody")))
-        
-        # Petit délai pour être sûr que tout le JS est chargé
-        time.sleep(3) 
-        
-        rows = driver.find_elements(By.CSS_SELECTOR, "tbody tr")
-        print(f"📊 {len(rows)} lignes trouvées.")
-        
-        for row in rows:
-            cols = row.find_elements(By.TAG_NAME, "td")
-            if len(cols) < 8: continue
-            
-            # Mapping basé sur l'observation standard de la Bourse de Casa
-            # 0: Nom, 4: Dernier cours, 10 ou 11: Volume Montant (à vérifier selon affichage)
-            # On prend souvent le dernier cours et le volume global
-            
-            nom = cols[0].text.strip()
-            prix_txt = cols[4].text.strip()
-            # Astuce: Parfois le volume est plus loin, on prend souvent la col 9 ou 10 pour le nbr de titres
-            # Pour simplifier ici, on suppose que col 11 est le volume en Montant (Capital échangé)
-            # Si indisponible, on met 0.
-            vol_txt = "0"
-            if len(cols) > 10:
-                vol_txt = cols[-2].text.strip() # Souvent l'avant dernière est le volume montant
-            
-            prix = clean_number(prix_txt)
-            volume_mad = clean_number(vol_txt)
-            
-            if prix > 0:
-                data_extracted.append({
-                    "symbol": nom,
-                    "close": prix,
-                    "volume": volume_mad
-                })
-                
-    except Exception as e:
-        print(f"❌ Erreur Scraping : {e}")
-    finally:
-        driver.quit()
-        
-    return data_extracted
 
-# --- MODULE 3: ANALYSE QUANTITATIVE ---
+def get_latest_session_date():
+    """Retourne la dernière séance disponible dans historical_quotes."""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT MAX(Date) FROM historical_quotes")
+    row = cursor.fetchone()
+    conn.close()
+    return row[0] if row and row[0] is not None else None
+
+
+def get_instruments_from_db():
+    """Retourne la liste (id, symbol) depuis la table instruments."""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, symbol FROM instruments")
+    rows = cursor.fetchall()
+    conn.close()
+    return [{"id": r[0], "symbol": r[1]} for r in rows]
+
+
+def sync_instruments_from_casabourse() -> int:
+    """
+    Synchronise la table instruments avec la liste casabourse.
+
+    Stratégie:
+      - Récupère tous les instruments via casabourse.get_available_instrument().
+      - Filtre sur les symboles à 3 lettres (actions cash, ~79 sociétés).
+      - Upsert dans la table instruments (symbol, name).
+    Retourne le nombre de nouveaux instruments insérés.
+    """
+    df = cb.get_available_instrument()
+    # Heuristique: les actions au comptant ont un symbole à 3 lettres
+    df_actions = df[df["Symbole"].astype(str).str.len() == 3].copy()
+
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    # S'assure que la table existe (au cas où)
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS instruments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL UNIQUE,
+            name TEXT
+        )
+        """
+    )
+    conn.commit()
+
+    cur.execute("SELECT symbol FROM instruments")
+    existing = {row[0] for row in cur.fetchall()}
+
+    inserted = 0
+    for _, row in df_actions.iterrows():
+        sym = str(row["Symbole"]).strip()
+        name = str(row["Nom"]).strip() if "Nom" in df_actions.columns else None
+        if not sym:
+            continue
+        if sym in existing:
+            # Met à jour le nom si besoin
+            cur.execute(
+                "UPDATE instruments SET name = ? WHERE symbol = ?",
+                (name, sym),
+            )
+        else:
+            cur.execute(
+                """
+                INSERT INTO instruments (symbol, name)
+                VALUES (?, ?)
+                """,
+                (sym, name),
+            )
+            inserted += 1
+
+    conn.commit()
+    conn.close()
+
+    print(
+        f"🔄 Synchronisation des instruments terminée. "
+        f"{inserted} nouveaux instruments insérés, total attendu ~{len(df_actions)} actions."
+    )
+    return inserted
+
+def save_history(
+    conn: sqlite3.Connection,
+    instrument_id: int,
+    df: pd.DataFrame,
+) -> int:
+    """
+    Sauvegarde les données historiques pour un instrument dans historical_quotes.
+
+    Cette fonction reprend la logique de save_history du scraper initial :
+    - aligne les colonnes du DataFrame avec la table,
+    - fait un INSERT OR REPLACE basé sur (instrument_id, Date) via la contrainte UNIQUE.
+    """
+    if df.empty:
+        return 0
+
+    cur = conn.cursor()
+
+    df = df.copy()
+    if "Symbol" in df.columns:
+        df = df.drop(columns=["Symbol"])
+
+    columns = list(df.columns)
+    placeholders = ", ".join("?" for _ in columns)
+    columns_sql = ", ".join(
+        f'"{c.strip().replace(" ", "_").replace("%", "pct")}"' for c in columns
+    )
+
+    inserted = 0
+    for _, row in df.iterrows():
+        values = [str(row[c]) if not pd.isna(row[c]) else None for c in df.columns]
+        cur.execute(
+            f"""
+            INSERT OR REPLACE INTO historical_quotes (instrument_id, {columns_sql})
+            VALUES (?, {placeholders})
+            """,
+            [instrument_id, *values],
+        )
+        inserted += 1
+
+    conn.commit()
+    return inserted
+
+
+def update_daily_data(max_instruments: int | None = None) -> int:
+    """
+    Met à jour historical_quotes avec les nouvelles séances via casabourse.
+
+    - Cherche la dernière Date présente dans historical_quotes.
+    - Pour chaque instrument en base, appelle casabourse.get_historical_data_auto
+      sur l'intervalle [dernière_date+1, aujourd'hui].
+    - Insère / remplace les lignes dans historical_quotes via save_history().
+
+    Retourne le nombre total de lignes ajoutées/mises à jour.
+    """
+    # Avant toute chose, on s'assure que la table instruments est synchro
+    sync_instruments_from_casabourse()
+
+    last_date = get_latest_session_date()
+    if last_date:
+        start_dt = datetime.datetime.strptime(last_date, "%Y-%m-%d").date() + timedelta(days=1)
+    else:
+        # Si aucune date, on ne fait rien ici (la base doit être initialisée par scraper.py)
+        print("⚠️ Aucune date existante dans historical_quotes, aucune mise à jour quotidienne effectuée.")
+        return 0
+
+    today = date.today()
+    if start_dt > today:
+        print(f"ℹ️ Aucune nouvelle séance à récupérer (dernière date = {last_date}).")
+        return 0
+
+    start_s = start_dt.strftime("%Y-%m-%d")
+    end_s = today.strftime("%Y-%m-%d")
+    print(f"🔄 Mise à jour quotidienne des données de {start_s} à {end_s}...")
+
+    instruments = get_instruments_from_db()
+    if max_instruments is not None:
+        instruments = instruments[:max_instruments]
+
+    conn = sqlite3.connect(DB_NAME)
+    total_rows = 0
+    try:
+        for idx, inst in enumerate(instruments, start=1):
+            sym = inst["symbol"]
+            instrument_id = inst["id"]
+            print(f"  ▶️ [{idx}/{len(instruments)}] Mise à jour de {sym}...")
+            try:
+                df = cb.get_historical_data_auto(sym, start_s, end_s)
+                if df is None or df.empty:
+                    continue
+                if "Date" not in df.columns:
+                    # casabourse devrait renvoyer une colonne Date; si ce n'est pas le cas on ignore
+                    continue
+                # Normalisation du format de date
+                df["Date"] = pd.to_datetime(df["Date"]).dt.strftime("%Y-%m-%d")
+                # On ajoute une colonne Symbol pour être cohérent avec save_history()
+                df.insert(0, "Symbol", sym)
+                rows = save_history(conn, instrument_id, df)
+                total_rows += rows
+            except Exception as exc:  # noqa: BLE001
+                print(f"❌ Erreur lors de la mise à jour de {sym}: {exc}")
+    finally:
+        conn.close()
+
+    print(f"✅ Mise à jour quotidienne terminée, {total_rows} lignes insérées/mises à jour.")
+    return total_rows
+
+
+def get_history(symbol, limit=60):
+    """Récupère l'historique pour l'analyse technique depuis historical_quotes."""
+    conn = sqlite3.connect(DB_NAME)
+    query = """
+        SELECT h.Date as date,
+               h."Dernier_cours" AS close_raw
+        FROM historical_quotes h
+        JOIN instruments i ON h.instrument_id = i.id
+        WHERE i.symbol = ?
+        ORDER BY h.Date ASC
+        LIMIT ?
+    """
+    df = pd.read_sql_query(query, conn, params=(symbol, limit))
+    conn.close()
+
+    if not df.empty:
+        df["close"] = df["close_raw"].apply(clean_number)
+        df = df.drop(columns=["close_raw"])
+    return df
+
+# --- MODULE 2: ANALYSE QUANTITATIVE ---
 def calculate_indicators(df):
     """Calcule RSI et SMA sur un DataFrame pandas."""
     if len(df) < 15: return None, None, None # Pas assez de data pour RSI 14
@@ -151,20 +253,39 @@ def calculate_indicators(df):
     
     return df.iloc[-1]['rsi'], df.iloc[-1]['sma20'], df.iloc[-1]['sma50']
 
+
 def analyze_opportunities():
+    """Analyse les opportunités à partir de la dernière séance dans bourse_casa.db."""
+    session_date = get_latest_session_date()
+    if not session_date:
+        print("❌ Aucune séance trouvée dans la base casablanca_bourse.db")
+        return []
+
     conn = sqlite3.connect(DB_NAME)
-    # On récupère la date d'aujourd'hui pour ne traiter que les données fraîches
-    today = datetime.date.today().isoformat()
     cursor = conn.cursor()
-    
-    # On récupère tous les tickers mis à jour aujourd'hui
-    cursor.execute("SELECT symbol, close, volume_mad FROM market_data WHERE date = ?", (today,))
-    todays_data = cursor.fetchall()
+
+    # On récupère tous les tickers pour la dernière séance
+    query = """
+        SELECT i.symbol,
+               h."Dernier_cours" AS close_raw,
+               h."Volume" AS volume_raw
+        FROM historical_quotes h
+        JOIN instruments i ON h.instrument_id = i.id
+        WHERE h.Date = ?
+    """
+    cursor.execute(query, (session_date,))
+    rows = cursor.fetchall()
     conn.close()
-    
+
+    todays_data = []
+    for symbol, close_raw, volume_raw in rows:
+        close = clean_number(close_raw or "0")
+        volume_mad = clean_number(volume_raw or "0")
+        todays_data.append((symbol, close, volume_mad))
+
     report_lines = []
-    
-    print(f"🧠 Analyse de {len(todays_data)} actifs...")
+
+    print(f"🧠 Analyse de {len(todays_data)} actifs pour la séance {session_date}...")
 
     for symbol, close, volume in todays_data:
         # 1. Filtre de Liquidité
@@ -219,7 +340,7 @@ def analyze_opportunities():
             
     return report_lines
 
-# --- MODULE 4: NOTIFICATION ---
+# --- MODULE 3: NOTIFICATION ---
 def send_telegram(lines):
     if not lines:
         print("Rien à signaler aujourd'hui.")
@@ -245,28 +366,28 @@ def send_telegram(lines):
     except Exception as e:
         print(f"Erreur connexion Telegram: {e}")
 
+def main():
+    """
+    Point d'entrée :
+      1) met à jour les données quotidiennes dans casablanca_bourse.db,
+      2) analyse les opportunités sur la dernière séance disponible,
+      3) envoie un rapport (Telegram ou console).
+    """
+    updated_rows = update_daily_data()
+    alerts = analyze_opportunities()
+
+    # On ajoute une ligne d'en-tête de santé dans le rapport
+    health_line = (
+        f"✅ Mise à jour quotidienne effectuée.\n"
+        f"Lignes mises à jour/ajoutées: {updated_rows}\n"
+        f"Signaux trouvés: {len(alerts)}"
+    )
+    if alerts:
+        send_telegram([health_line] + alerts)
+    else:
+        send_telegram([health_line])
+
+
 # --- MAIN ---
 if __name__ == "__main__":
-    # 1. Initialiser la DB (si elle n'existe pas)
-    init_db()
-    
-    # 2. Scraper les données fraiches
-    data = scrape_market()
-    
-    # 3. Sauvegarder
-    if data:
-        save_daily_data(data)
-        
-        # 4. Analyser & Notifier
-        # Note importante : Au premier lancement, l'analyse ne donnera rien 
-        # car il faut environ 20 jours de données pour calculer une Moyenne Mobile 20.
-        # Le script accumulera les données jour après jour.
-        alerts = analyze_opportunities()
-        
-        if len(data) > 0 and len(alerts) == 0:
-            # Message pour rassurer l'utilisateur au début (Cold Start)
-            send_telegram([f"Données mises à jour pour {len(data)} actions.\nPas assez d'historique pour l'analyse technique (Mode Apprentissage activé)."])
-        else:
-            send_telegram(alerts)
-    else:
-        print("❌ Aucune donnée récupérée.")
+    main()
