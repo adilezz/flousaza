@@ -1,35 +1,49 @@
-name: Wafa Scraper
+name: Bourse Casa Daily Scan
 
 on:
   schedule:
-    # Rappel : 15h00 UTC = 16h00 Maroc
+    # 15:00 UTC = 16:00 au Maroc (GMT+1)
+    # Du Lundi (1) au Vendredi (5)
     - cron: '0 15 * * 1-5'
-  workflow_dispatch:
+  workflow_dispatch: # Permet de lancer manuellement pour tester
+
+permissions:
+  contents: write # INDISPENSABLE : Donne le droit au bot d'écrire dans le repo
 
 jobs:
-  build:
+  run-analysis:
     runs-on: ubuntu-latest
 
     steps:
+      # 1. Récupérer le code
       - name: Checkout code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
 
+      # 2. Installer Python
       - name: Set up Python
-        uses: actions/setup-python@v2
+        uses: actions/setup-python@v4
         with:
           python-version: '3.9'
 
-      # Chrome est déjà pré-installé sur ubuntu-latest, 
-      # mais on s'assure que tout est propre.
-      
-      - name: Install libraries
+      # 3. Installer les dépendances
+      - name: Install dependencies
         run: |
-          pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run Analysis
+      # 4. Lancer le script (avec les secrets)
+      - name: Run Trading Bot
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
+        run: python BotBourse.py
+
+      # 5. SAUVEGARDER LA MÉMOIRE (Commit & Push DB)
+      # C'est ici qu'on empêche la perte de l'historique
+      - name: Commit and Push Database
         run: |
-          python main.py
+          git config --global user.name "GitHub Action Bot"
+          git config --global user.email "actions@github.com"
+          git add bourse_casa.db
+          # On ne commit que s'il y a des changements (pour éviter les erreurs)
+          git commit -m "📈 Mise à jour automatique: Base de données historique" || exit 0
+          git push
