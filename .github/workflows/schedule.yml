@@ -1,0 +1,35 @@
+name: Wafa Scraper
+
+on:
+  schedule:
+    # Rappel : 15h00 UTC = 16h00 Maroc
+    - cron: '0 15 * * 1-5'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Set up Python
+        uses: actions/setup-python@v2
+        with:
+          python-version: '3.9'
+
+      # Chrome est déjà pré-installé sur ubuntu-latest, 
+      # mais on s'assure que tout est propre.
+      
+      - name: Install libraries
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Analysis
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+        run: |
+          python main.py
