@@ -1,2 +1,7 @@
 casabourse>=0.1.0
 pandas>=2.0.0
+requests>=2.31.0
+python-telegram-bot>=20.0  # Pour le futur bot sur Render
+matplotlib>=3.7.0          # Pour générer les graphiques
+mplfinance>=0.12.9         # Pour les graphiques financiers (bougies)
+schedule>=1.2.0            # Pour la gestion des tâches sur Render
