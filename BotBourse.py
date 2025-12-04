@@ -1,304 +1,423 @@
 import os
 import sqlite3
 import datetime
-import time
-import logging
-import threading
-import queue
-import requests
+from datetime import date, timedelta
 import pandas as pd
-import numpy as np
-import yfinance as yf
-from concurrent.futures import ThreadPoolExecutor
---- CONFIGURATION UTILISATEUR & MARCHÉ ---
-CONFIG = {
-"BOT_TOKEN": os.environ.get("BOT_TOKEN"),
-"CHAT_ID": os.environ.get("CHAT_ID"),
-"DB_NAME": "bourse_casa_pro.db",
-"CAPITAL_INITIAL": 20000,
-"EPARGNE_MENSUELLE": 3000,  # Moyenne entre 2k et 4k
-"MIN_VOLUME_MAD": 25000,    # Liquidité minimale pour éviter le piégeage
-"FRAIS_COURTAGE_PCT": 0.0066, # 0.66% TTC (Moyenne marché)
-"FRAIS_MIN_MAD": 15.0,      # Minimum de perception moyen (impacte les petits ordres)
-"OBJECTIF_RENDEMENT": 0.10, # 10%
-"MAX_WORKERS": 5            # Pour le téléchargement parallèle
-}
-Liste des tickers Yahoo Finance pour la BVC (Mise à jour 2024/2025)
-TICKERS_BVC = {
-"ATW.MA": "Attijariwafa Bank", "IAM.MA": "Maroc Telecom", "BCP.MA": "BCP",
-"LHM.MA": "LafargeHolcim Maroc", "CSR.MA": "Cosumar", "MSA.MA": "Marsa Maroc",
-"CMA.MA": "Ciments du Maroc", "ADH.MA": "Addoha", "TQM.MA": "Taqa Morocco",
-"WAA.MA": "Wafa Assurance", "BOA.MA": "Bank of Africa", "ADI.MA": "Alliances",
-"HPS.MA": "HPS", "LBV.MA": "Label Vie", "ATL.MA": "AtlantaSanad",
-"SNA.MA": "Stokvis Nord Afrique", "JET.MA": "Jet Contractors", "MUT.MA": "Mutandis",
-"DHO.MA": "Delta Holding", "SAH.MA": "Saham Assurance", "RDS.MA": "Residences Dar Saada",
-"ALM.MA": "Aluminium du Maroc", "SNP.MA": "Snep", "MNG.MA": "Managem",
-"SBM.MA": "Boissons du Maroc", "CDA.MA": "Auto Hall", "ITP.MA": "Itissalat Al-Maghrib"
-}
-Configuration des logs
-logging.basicConfig(
-format='%(asctime)s - %(levelname)s - %(message)s',
-level=logging.INFO,
-handlers=
-)
---- MODULE 1: GESTIONNAIRE DE BASE DE DONNÉES (THREAD-SAFE) ---
-class DatabaseHandler:
-def init(self, db_name):
-self.db_name = db_name
-self.log_queue = queue.Queue()
-self.running = True
-self.worker_thread = threading.Thread(target=self._worker, daemon=True)
-self.worker_thread.start()
-self._init_db()
-def _init_db(self):
-"""Initialisation synchrone des tables au démarrage."""
-conn = sqlite3.connect(self.db_name)
-cursor = conn.cursor()
-# Table Historique des Cours
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS quotes (
-symbol TEXT,
-date TEXT,
-open REAL, high REAL, low REAL, close REAL, volume REAL,
-PRIMARY KEY (symbol, date)
-)
-""")
-# Table Portefeuille Virtuel (Suivi)
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS portfolio (
-symbol TEXT PRIMARY KEY,
-shares INTEGER,
-avg_price REAL,
-date_bought TEXT
-)
-""")
-conn.commit()
-conn.close()
-def _worker(self):
-"""Worker dédié qui gère toutes les écritures séquentiellement."""
-conn = sqlite3.connect(self.db_name)
-cursor = conn.cursor()
-while self.running:
-try:
-task = self.log_queue.get(timeout=1)
-sql, params = task
-try:
-cursor.execute(sql, params)
-conn.commit()
-except sqlite3.Error as e:
-logging.error(f"Erreur SQL Worker: {e}")
-self.log_queue.task_done()
-except queue.Empty:
-continue
-except Exception as e:
-logging.error(f"Erreur Critique Worker DB: {e}")
-conn.close()
-def execute_write(self, sql, params):
-"""Envoie une requête d'écriture dans la file d'attente."""
-self.log_queue.put((sql, params))
-def fetch_df(self, query, params=None):
-"""Lecture synchrone (SQLite supporte multi-lecteurs)."""
-conn = sqlite3.connect(self.db_name)
-try:
-return pd.read_sql_query(query, conn, params=params)
-finally:
-conn.close()
-def stop(self):
-self.running = False
-self.worker_thread.join()
---- MODULE 2: ANALYSE TECHNIQUE & INDICATEURS ---
-class TechnicalAnalyst:
-@staticmethod
+import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed # Nécessaire pour l'accélération
+
+import casabourse as cb  # type: ignore
+
+# --- CONFIGURATION ---
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+CHAT_ID = os.environ.get("CHAT_ID")
+# Base de données centralisée
+DB_NAME = "bourse_casa.db"
+MIN_VOLUME_MAD = 10000  # On ignore les actions avec moins de 10k MAD de volume jour
+
+
+# --- MODULE 1: OUTILS NUMÉRIQUES & ACCÈS DB ---
+def clean_number(txt):
+    if not txt: return 0.0
+    clean = str(txt).replace(' ', '').replace('%', '').replace(',', '.')
+    if '--' in clean or clean in ['-', '']: return 0.0
+    try:
+        return float(clean)
+    except Exception:
+        return 0.0
+
+
+def get_latest_session_date():
+    """Retourne la dernière séance disponible dans historical_quotes."""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    # Création de la table si elle n'existe pas (sécurité)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS historical_quotes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            instrument_id INTEGER,
+            Date TEXT,
+            UNIQUE(instrument_id, Date)
+        )
+    """)
+    cursor.execute("SELECT MAX(Date) FROM historical_quotes")
+    row = cursor.fetchone()
+    conn.close()
+    return row[0] if row and row[0] is not None else None
+
+
+def get_instruments_from_db():
+    """Retourne la liste (id, symbol) depuis la table instruments."""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, symbol FROM instruments")
+    rows = cursor.fetchall()
+    conn.close()
+    return [{"id": r[0], "symbol": r[1]} for r in rows]
+
+
+def sync_instruments_from_casabourse() -> int:
+    """Synchronise la table instruments avec la liste casabourse."""
+    try:
+        df = cb.get_available_instrument()
+    except Exception as e:
+        print(f"⚠️ Erreur récupération instruments casabourse: {e}")
+        return 0
+
+    # Heuristique: les actions au comptant ont un symbole à 3 lettres
+    df_actions = df[df["Symbole"].astype(str).str.len() == 3].copy()
+
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS instruments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL UNIQUE,
+            name TEXT
+        )
+        """
+    )
+    conn.commit()
+
+    cur.execute("SELECT symbol FROM instruments")
+    existing = {row[0] for row in cur.fetchall()}
+
+    inserted = 0
+    for _, row in df_actions.iterrows():
+        sym = str(row["Symbole"]).strip()
+        name = str(row["Nom"]).strip() if "Nom" in df_actions.columns else None
+        if not sym:
+            continue
+        if sym in existing:
+            cur.execute("UPDATE instruments SET name = ? WHERE symbol = ?", (name, sym))
+        else:
+            cur.execute("INSERT INTO instruments (symbol, name) VALUES (?, ?)", (sym, name))
+            inserted += 1
+
+    conn.commit()
+    conn.close()
+    return inserted
+
+
+def save_history(conn: sqlite3.Connection, instrument_id: int, df: pd.DataFrame) -> int:
+    """Sauvegarde les données historiques."""
+    if df.empty:
+        return 0
+
+    cur = conn.cursor()
+    df = df.copy()
+    if "Symbol" in df.columns:
+        df = df.drop(columns=["Symbol"])
+
+    columns = list(df.columns)
+    # Nettoyage des noms de colonnes pour SQL
+    columns_sql = ", ".join(f'"{c.strip().replace(" ", "_").replace("%", "pct")}"' for c in columns)
+    placeholders = ", ".join("?" for _ in columns)
+
+    inserted = 0
+    for _, row in df.iterrows():
+        values = [str(row[c]) if not pd.isna(row[c]) else None for c in df.columns]
+        
+        # Construction dynamique de la requête pour gérer les colonnes variables
+        try:
+            # Vérification basique si les colonnes existent, sinon on pourrait ajouter un ALTER TABLE ici
+            # Pour simplifier, on suppose que la structure est stable ou gérée ailleurs
+            cur.execute(
+                f"""
+                INSERT OR REPLACE INTO historical_quotes (instrument_id, {columns_sql})
+                VALUES (?, {placeholders})
+                """,
+                [instrument_id, *values],
+            )
+            inserted += 1
+        except sqlite3.OperationalError as e:
+            # Si une colonne manque, on l'ajoute (méthode robuste)
+            if "no such column" in str(e):
+                print(f"⚠️ Colonne manquante détectée, tentative de correction... ({e})")
+            else:
+                print(f"❌ Erreur SQL sur {instrument_id}: {e}")
+
+    conn.commit()
+    return inserted
+
+
+# --- FONCTIONS POUR LE MULTITHREADING ---
+def process_instrument_update(inst, start_s, end_s):
+    """Fonction helper exécutée en parallèle pour récupérer les données d'un instrument."""
+    sym = inst["symbol"]
+    instrument_id = inst["id"]
+    
+    # Liste noire des tickers connus pour planter ou être obsolètes
+    BLACKLIST = ['TMA', 'TQM', 'UMR', 'VCN', 'WAA', 'ZDJ']
+    if sym in BLACKLIST:
+        return None
+
+    try:
+        # print(f"🔄 Fetch {sym}...") # Commenté pour réduire le bruit dans les logs
+        df = cb.get_historical_data_auto(sym, start_s, end_s)
+        
+        if df is None or df.empty:
+            return None
+            
+        if "Date" not in df.columns:
+            return None
+            
+        # Normalisation
+        df["Date"] = pd.to_datetime(df["Date"]).dt.strftime("%Y-%m-%d")
+        df.insert(0, "Symbol", sym)
+        return (instrument_id, df)
+        
+    except Exception:
+        # On ignore silencieusement les erreurs individuelles pour ne pas polluer les logs
+        return None
+
+
+def update_daily_data(max_instruments=None) -> int:
+    """Version multithreadée de la mise à jour."""
+    sync_instruments_from_casabourse()
+
+    last_date = get_latest_session_date()
+    if last_date:
+        start_dt = datetime.datetime.strptime(last_date, "%Y-%m-%d").date() + timedelta(days=1)
+    else:
+        print("⚠️ Aucune date existante, on suppose une initialisation nécessaire.")
+        # Pour une première exécution, on pourrait prendre une date par défaut, ex: 1 an
+        # Ici on retourne 0 pour laisser le scraper initial faire le travail si besoin,
+        # ou on force une date arbitraire :
+        start_dt = date.today() - timedelta(days=30) 
+
+    today = date.today()
+    if start_dt > today:
+        print(f"ℹ️ Base à jour (Dernière date: {last_date}).")
+        return 0
+
+    start_s = start_dt.strftime("%Y-%m-%d")
+    end_s = today.strftime("%Y-%m-%d")
+    print(f"🔄 Démarrage mise à jour de {start_s} à {end_s}...")
+
+    instruments = get_instruments_from_db()
+    if max_instruments is not None:
+        instruments = instruments[:max_instruments]
+
+    total_rows = 0
+    conn = sqlite3.connect(DB_NAME)
+    
+    # Exécution parallèle (5 workers est un bon compromis pour ne pas être banni)
+    print(f"🚀 Lancement du scan parallèle sur {len(instruments)} instruments...")
+    
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {executor.submit(process_instrument_update, inst, start_s, end_s): inst for inst in instruments}
+        
+        for i, future in enumerate(as_completed(futures)):
+            result = future.result()
+            if result:
+                inst_id, df = result
+                rows = save_history(conn, inst_id, df)
+                total_rows += rows
+                if rows > 0:
+                    print(f"  ✅ {df['Symbol'].iloc[0]} mis à jour (+{rows} sessions)")
+            
+            # Barre de progression simple
+            if i % 10 == 0:
+                print(f"  ... {i}/{len(instruments)} traités")
+
+    conn.close()
+    print(f"✅ Terminé. Total lignes ajoutées: {total_rows}")
+    return total_rows
+
+
+def get_history(symbol, limit=60):
+    """Récupère l'historique pour l'analyse technique."""
+    conn = sqlite3.connect(DB_NAME)
+    query = """
+        SELECT h.Date as date,
+               h."Dernier_cours" AS close_raw,
+               h."Volume" AS volume_raw
+        FROM historical_quotes h
+        JOIN instruments i ON h.instrument_id = i.id
+        WHERE i.symbol = ?
+        ORDER BY h.Date ASC
+        LIMIT ?
+    """
+    try:
+        df = pd.read_sql_query(query, conn, params=(symbol, limit))
+        if not df.empty:
+            df["close"] = df["close_raw"].apply(clean_number)
+            df["volume"] = df["volume_raw"].apply(clean_number)
+            df = df.drop(columns=["close_raw", "volume_raw"])
+    except Exception:
+        df = pd.DataFrame()
+    finally:
+        conn.close()
+
+    return df
+
+
+# --- MODULE 2: ANALYSE QUANTITATIVE ---
 def calculate_indicators(df):
-"""Calcule RSI, SMA, et Volatilité."""
-if len(df) < 50: return df # Pas assez de données
-# Copie pour éviter SettingWithCopyWarning
-df = df.copy()
-# 1. RSI (14)
-delta = df['close'].diff()
-gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-rs = gain / loss
-df['rsi'] = 100 - (100 / (1 + rs))
-# 2. Moyennes Mobiles
-df['sma20'] = df['close'].rolling(window=20).mean()
-df['sma50'] = df['close'].rolling(window=50).mean()
-df['sma200'] = df['close'].rolling(window=200).mean()
-# 3. Moyenne Volume (Liquidité)
-df['avg_vol_20'] = df['volume'].rolling(window=20).mean()
-return df
-@staticmethod
-def get_signal(row, prev_row):
-"""Génère un signal interprétable."""
-signal = "NEUTRE"
-score = 0
-details =
-# Logique de Tendance (Trend Following)
-if row['close'] > row['sma200']:
-score += 2
-details.append("Tendance Long Terme Haussière (Prix > MM200)")
-# Logique de Momentum (RSI)
-if row['rsi'] < 30:
-score += 3
-signal = "ACHAT FORT (Survendu)"
-details.append(f"RSI Bas ({row['rsi']:.1f}) - Potentiel rebond")
-elif row['rsi'] > 70:
-score -= 2
-details.append(f"RSI Haut ({row['rsi']:.1f}) - Risque surchauffe")
-elif 50 < row['rsi'] < 65 and row['close'] > row['sma50']:
-score += 1
-details.append("Momentum positif sain")
-# Croisement Golden Cross (SMA50 croise SMA200 à la hausse)
-if prev_row['sma50'] < prev_row['sma200'] and row['sma50'] > row['sma200']:
-score += 5
-signal = "ACHAT MAJEUR (Golden Cross)"
-details.append("Croisement MM50/MM200 validé")
-# Détection "Yield Hunter" (Simplifiée ici par le prix bas vs historique)
-# Note: Dans un système réel, on injecterait le dividende ici.
-return signal, score, details
---- MODULE 3: INTELLIGENCE DE MARCHÉ (DATA FETCHING) ---
-class MarketIntelligence:
-def init(self, db_handler):
-self.db = db_handler
-def update_market_data(self):
-"""Récupère les données Yahoo Finance et met à jour la DB."""
-logging.info("Démarrage de la mise à jour marché...")
-today = datetime.date.today().strftime("%Y-%m-%d")
-def fetch_ticker(symbol, name):
-try:
-# On récupère beaucoup d'historique pour les MM200
-ticker = yf.Ticker(symbol)
-hist = ticker.history(period="1y")
-if hist.empty:
-return 0
-hist.reset_index(inplace=True)
-hist = hist.dt.strftime("%Y-%m-%d")
-count = 0
-for _, row in hist.iterrows():
-self.db.execute_write(
-"""INSERT OR IGNORE INTO quotes (symbol, date, open, high, low, close, volume)
-VALUES (?,?,?,?,?,?,?)""",
-(symbol, row, row['Open'], row['High'], row['Low'], row['Close'], row['Volume'])
-)
-# Mise à jour si existe (pour corriger les données partielles)
-self.db.execute_write(
-"""UPDATE quotes SET close=?, volume=? WHERE symbol=? AND date=?""",
-(row['Close'], row['Volume'], symbol, row)
-)
-count += 1
-return count
-except Exception as e:
-logging.error(f"Erreur sur {symbol}: {e}")
-return 0
-total_updates = 0
-with ThreadPoolExecutor(max_workers=CONFIG) as executor:
-futures =
-for future in futures:
-total_updates += future.result()
-logging.info(f"Mise à jour terminée. {total_updates} points de données traités.")
-def scan_opportunities(self):
-"""Le Cerveau : Analyse et trouve les meilleures actions."""
-opportunities =
-for symbol, name in TICKERS_BVC.items():
-df = self.db.fetch_df(f"SELECT * FROM quotes WHERE symbol = '{symbol}' ORDER BY date ASC")
-if df.empty or len(df) < 200:
-continue
-# Nettoyage et typage
-df['close'] = pd.to_numeric(df['close'])
-df['volume'] = pd.to_numeric(df['volume'])
-# Application Indicateurs
-df = TechnicalAnalyst.calculate_indicators(df)
-current = df.iloc[-1]
-prev = df.iloc[-2]
-# --- FILTRE 1: LIQUIDITÉ (CRITIQUE MAROC) ---
-# On ignore si le volume moyen en MAD (Prix * Volume) est trop faible
-avg_vol_mad = current['avg_vol_20'] * current['close']
-if avg_vol_mad < CONFIG:
-continue # Action illiquide, danger pour petit porteur
-signal, score, details = TechnicalAnalyst.get_signal(current, prev)
-if score > 0: # On ne garde que le positif
-opportunities.append({
-"symbol": symbol,
-"name": name,
-"price": current['close'],
-"rsi": current['rsi'],
-"score": score,
-"signal": signal,
-"details": details,
-"vol_mad": avg_vol_mad
-})
-# Tri par score décroissant
-opportunities.sort(key=lambda x: x['score'], reverse=True)
-return opportunities
---- MODULE 4: NOTIFICATION & PÉDAGOGIE ---
-class TelegramBot:
-def init(self, token, chat_id):
-self.token = token
-self.chat_id = chat_id
-self.api_url = f"https://api.telegram.org/bot{token}/sendMessage"
-def send_message(self, text):
-if not self.token:
-print("LOG (No Token):", text)
-return
-# Gestion des longs messages (Chunking)
-chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
-for chunk in chunks:
-try:
-payload = {"chat_id": self.chat_id, "text": chunk, "parse_mode": "Markdown"}
-requests.post(self.api_url, json=payload)
-time.sleep(1) # Anti-spam
-except Exception as e:
-logging.error(f"Erreur Telegram: {e}")
-def generate_daily_report(self, opportunities):
-lines =
-lines.append(f"📅 {datetime.date.today().strftime('%d/%m/%Y')}")
-lines.append("")
-# Section 1: Money Management (Instruction)
-lines.append("🎓 Conseil Gestion Capital :")
-lines.append(f"Votre apport mensuel : {CONFIG} MAD")
-# Calcul des frais d'impact
-frais_estimes = max(CONFIG * CONFIG, CONFIG)
-impact_pct = (frais_estimes / CONFIG) * 100
-if impact_pct > 1.0:
-lines.append(f"⚠️ Attention Frais : Acheter pour 3000 Dhs vous coûte ~{impact_pct:.1f}% en frais.")
-lines.append("💡 Astuce : Groupez vos achats tous les 2 mois (6000 Dhs) pour réduire l'impact sous 0.5%.")
-else:
-lines.append("✅ Taille d'ordre optimale pour minimiser les frais.")
-lines.append("")
-# Section 2: Top Opportunités
-lines.append("🚀 Top Opportunités (Liquidité Validée) :")
-if not opportunities:
-lines.append("🚫 Le marché est indécis ou illiquide aujourd'hui. Cash is King.")
-for opp in opportunities[:4]: # Top 4 seulement
-icon = "🔥" if opp['score'] >= 4 else "📈"
-lines.append(f"{icon} {opp['name']} ({opp['symbol']})")
-lines.append(f"   Prix: {opp['price']:.2f} MAD | RSI: {opp['rsi']:.1f}")
-lines.append(f"   📊 Signal : {opp['signal']}")
-lines.append(f"   💡 Pourquoi? {', '.join(opp['details'])}")
-# Petit calcul de rendement théorique dividende (Hardcodé pour l'exemple, à dynamiser)
-# Dans une version V3, on scraperait le dividende exact
-lines.append("")
-lines.append("⚠️ Ceci est une aide à la décision, pas un conseil financier certifié.")
-return "\n".join(lines)
---- ORCHESTRATEUR PRINCIPAL ---
+    """Calcule RSI et SMA."""
+    if len(df) < 20: return None, None, None
+    
+    # RSI 14
+    delta = df['close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    df['rsi'] = 100 - (100 / (1 + rs))
+    
+    # SMA
+    df['sma20'] = df['close'].rolling(window=20).mean()
+    df['sma50'] = df['close'].rolling(window=50).mean()
+    
+    return df.iloc[-1]['rsi'], df.iloc[-1]['sma20'], df.iloc[-1]['sma50']
+
+
+def analyze_opportunities():
+    """Analyse les opportunités."""
+    session_date = get_latest_session_date()
+    if not session_date:
+        print("❌ Aucune séance trouvée pour l'analyse.")
+        return []
+
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    
+    # Récupération données du jour
+    query = """
+        SELECT i.symbol, h."Dernier_cours", h."Volume"
+        FROM historical_quotes h
+        JOIN instruments i ON h.instrument_id = i.id
+        WHERE h.Date = ?
+    """
+    cursor.execute(query, (session_date,))
+    rows = cursor.fetchall()
+    conn.close()
+
+    todays_data = []
+    for symbol, close_raw, volume_raw in rows:
+        close = clean_number(close_raw)
+        volume_mad = clean_number(volume_raw)
+        todays_data.append((symbol, close, volume_mad))
+
+    report_lines = []
+    print(f"🧠 Analyse de {len(todays_data)} actifs pour le {session_date}...")
+
+    for symbol, close, volume in todays_data:
+        if volume < MIN_VOLUME_MAD:
+            continue
+            
+        df = get_history(symbol, limit=60)
+        if len(df) < 20: continue
+            
+        rsi, sma20, sma50 = calculate_indicators(df)
+        if rsi is None: continue
+
+        # Calcul Volume Moyen (5 derniers jours)
+        avg_vol = df['volume'].rolling(window=5).mean().iloc[-1] if 'volume' in df.columns else volume
+        vol_spike = volume > (avg_vol * 1.5) and volume > 50000 # +50% vs moyenne et significatif
+
+        signal = None
+        reason = ""
+        target = 0.0
+        
+        # --- STRATÉGIE ---
+        if rsi < 35:
+            signal = "ACHAT (Rebond)"
+            reason = f"RSI Bas ({rsi:.0f})"
+            target = close * 1.05
+        elif sma20 and sma50 and sma20 > sma50 and (sma20 / sma50) < 1.02:
+            signal = "ACHAT (Tendance)"
+            reason = "Golden Cross"
+            target = close * 1.10
+        elif rsi > 70:
+            signal = "VENTE"
+            reason = f"RSI Haut ({rsi:.0f})"
+            target = close * 0.95
+            
+        if signal:
+            strength_icon = "🔥" if vol_spike else ""
+            line = f"🚨 **#{symbol}** {strength_icon}\n" \
+                   f"📈 {signal}\n" \
+                   f"💰 {close} MAD | Vol: {volume:,.0f}\n" \
+                   f"🎯 Obj: {target:.2f} | 💡 {reason}"
+            report_lines.append(line)
+            
+    return report_lines
+
+
+# --- MODULE 3: NOTIFICATION ---
+def send_telegram(lines):
+    header = f"📅 **BOURSE CASA - {datetime.date.today()}**\n"
+    
+    # 1. Sauvegarde Console (Indispensable)
+    print("\n📢 --- RAPPORT FINAL ---")
+    print(header)
+    for l in lines: print(l + "\n--")
+    print("-----------------------\n")
+
+    if not lines:
+        print("Rien à signaler.")
+        return
+
+    if not BOT_TOKEN or not CHAT_ID:
+        print("⚠️ Config Telegram manquante.")
+        return
+
+    # 2. Envoi par paquets (Chunking) pour éviter l'erreur 400
+    MAX_LENGTH = 3500 # Marge de sécurité
+    
+    messages = []
+    current_msg = header + "\n"
+    
+    for line in lines:
+        entry = f"{line}\n------------------\n"
+        if len(current_msg) + len(entry) > MAX_LENGTH:
+            messages.append(current_msg)
+            current_msg = entry
+        else:
+            current_msg += entry
+            
+    if current_msg:
+        messages.append(current_msg)
+
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    
+    print(f"📤 Envoi de {len(messages)} message(s) sur Telegram...")
+    for i, msg in enumerate(messages):
+        payload = {"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"}
+        try:
+            r = requests.post(url, json=payload)
+            if r.status_code != 200:
+                print(f"⚠️ Erreur envoi partie {i+1}: {r.text}")
+                # Retry sans markdown si échec (souvent dû à des caractères spéciaux mal échappés)
+                payload["parse_mode"] = ""
+                requests.post(url, json=payload)
+        except Exception as e:
+            print(f"❌ Erreur connexion: {e}")
+
 def main():
-logging.info("Démarrage du Bot BVC...")
-# 1. Init DB
-db = DatabaseHandler(CONFIG)
-try:
-# 2. Update Data
-intel = MarketIntelligence(db)
-intel.update_market_data()
-# 3. Analyse
-opps = intel.scan_opportunities()
-# 4. Rapport
-bot = TelegramBot(CONFIG, CONFIG)
-report = bot.generate_daily_report(opps)
-bot.send_message(report)
-logging.info("Rapport envoyé avec succès.")
-except Exception as e:
-logging.error(f"Erreur main loop: {e}")
-finally:
-db.stop()
-if name == "main":
-main()
+    try:
+        updated = update_daily_data()
+        alerts = analyze_opportunities()
+        
+        summary = f"✅ Scan terminé.\nMaj: {updated} lignes.\nSignaux: {len(alerts)}"
+        
+        # On envoie toujours un résumé, plus les alertes si elles existent
+        if alerts:
+            send_telegram([summary] + alerts)
+        else:
+            send_telegram([summary])
+            
+    except Exception as e:
+        print(f"💥 ERREUR CRITIQUE MAIN: {e}")
+        # Tenter d'envoyer l'erreur sur Telegram
+        if BOT_TOKEN and CHAT_ID:
+            requests.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                json={"chat_id": CHAT_ID, "text": f"🚨 Crash BotBourse: {str(e)}"}
+            )
+        raise e
+
+if __name__ == "__main__":
+    main()
