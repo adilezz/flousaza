@@ -1,49 +1,39 @@
-name: Bourse Casa Daily Scan
+name: Scraper Bourse Casa (Data Only)
 
 on:
   schedule:
-    # 15:00 UTC = 16:00 au Maroc (GMT+1)
-    # Du Lundi (1) au Vendredi (5)
+    # 16h00 GMT+1 (Heure Bourse Maroc) du Lundi au Vendredi
     - cron: '0 15 * * 1-5'
-  workflow_dispatch: # Permet de lancer manuellement pour tester
+  workflow_dispatch: # Permet de forcer la mise à jour manuellement
 
 permissions:
-  contents: write # INDISPENSABLE : Donne le droit au bot d'écrire dans le repo
+  contents: write # Indispensable pour que le bot puisse commiter la DB
 
 jobs:
-  run-analysis:
+  update-db:
     runs-on: ubuntu-latest
-
+    
     steps:
-      # 1. Récupérer le code
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # 2. Installer Python
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.12'
 
-      # 3. Installer les dépendances
       - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
+        run: pip install -r requirements.txt
 
-      # 4. Lancer le script (avec les secrets)
-      - name: Run Trading Bot
-        env:
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          CHAT_ID: ${{ secrets.CHAT_ID }}
-        run: python BotBourse.py
+      - name: Lancer le Scraper
+        # Ce script met à jour bourse_casa.db
+        run: python scraper.py
 
-      # 5. SAUVEGARDER LA MÉMOIRE (Commit & Push DB)
-      # C'est ici qu'on empêche la perte de l'historique
-      - name: Commit and Push Database
+      - name: Sauvegarder la Base de Données
         run: |
-          git config --global user.name "GitHub Action Bot"
-          git config --global user.email "actions@github.com"
+          git config --global user.name "Bourse Data Bot"
+          git config --global user.email "bot@flousaza.com"
           git add bourse_casa.db
-          # On ne commit que s'il y a des changements (pour éviter les erreurs)
-          git commit -m "📈 Mise à jour automatique: Base de données historique" || exit 0
+          # Commit seulement s'il y a du changement
+          git commit -m "🗄️ Data Sync: $(date +'%Y-%m-%d')" || exit 0
           git push
