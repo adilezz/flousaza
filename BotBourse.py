@@ -3,7 +3,7 @@ import sqlite3
 import datetime
 from datetime import date, timedelta
 import pandas as pd
-import pandas_ta as ta  # Pour l'analyse technique (RSI, SMA)
+import pandas_ta_classic as ta  # Pour l'analyse technique (RSI, SMA)
 import requests
 import casabourse as cb
 from concurrent.futures import ThreadPoolExecutor, as_completed
