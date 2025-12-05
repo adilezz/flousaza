@@ -1,7 +1,8 @@
 casabourse>=0.1.0
 pandas>=2.0.0
-pandas_ta # NOUVEAU: Pour le calcul facile du RSI/SMA
 requests>=2.31.0
-beautifulsoup4>=4.12.0 # NOUVEAU: Pour scrapper les infos dividendes si besoin
+beautifulsoup4>=4.12.0
 python-telegram-bot>=20.0
 matplotlib>=3.7.0
+# Installation de pandas_ta depuis la source pour compatibilité Pandas 2.0
+git+https://github.com/twopirllc/pandas-ta.git@development
