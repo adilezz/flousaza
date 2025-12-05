@@ -3,410 +3,401 @@ import sqlite3
 import datetime
 from datetime import date, timedelta
 import pandas as pd
+import pandas_ta as ta  # Pour l'analyse technique (RSI, SMA)
 import requests
 import casabourse as cb
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# --- 1. CONFIGURATION & STRATÉGIE ---
+# --- 1. CONFIGURATION DYNAMIQUE ---
 
-# Paramètres Système
-DB_NAME = "bourse_casa.db"
+# On récupère les secrets de l'environnement, sinon valeurs par défaut pour test local
+DB_NAME = "bourse_casa_pro.db"
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
-# Paramètres Investisseur (DCA)
-BUDGET_MENSUEL = 4000.0  # Votre apport mensuel en MAD
-MIN_VOLUME_MAD = 5000.0  # Filtre de liquidité minimum
+# Stratégie Financière
+BUDGET_MENSUEL = 4000.0     # Apport mensuel
+MAX_ALLOCATION_PER_STOCK = 0.20 # Max 20% du portefeuille sur une seule action (Diversification)
+MIN_RSI = 30                # Zone de survente (Bon pour acheter)
+MAX_RSI = 70                # Zone de surachat (Dangereux)
+MIN_YIELD = 3.5             # Rendement dividende minimum visé pour les valeurs de fond
 
-# Whitelist "Bon Père de Famille" (Valeurs de Rendement & Croissance Sûre)
-# Ces actions sont priorisées pour le DCA si elles sont en tendance haussière.
-YIELD_STOCKS = [
-    'IAM',  # Maroc Telecom (Rendement)
-    'BCP',  # Banque Populaire (Solide)
-    'ATW',  # Attijariwafa Bank (Leader)
-    'CIM',  # Ciments du Maroc (Dividende)
-    'LHM',  # LafargeHolcim (Construction)
-    'MSA',  # Marsa Maroc (Croissance + Div)
-    'COS',  # Cosumar (Défensive)
-    'TQM',  # Taqa Morocco (Utilities)
-]
-
-# Blacklist (Actions à éviter : illiquides, spéculatives ou données erratiques)
-BLACKLIST = ['ZDJ', 'DLM', 'IBM', 'SOP', 'NEJ']
-
-# --- 2. GESTION DE LA BASE DE DONNÉES (SOCLE) ---
+# --- 2. GESTION DE LA BASE DE DONNÉES (PERSISTANCE) ---
 
 def get_db_connection():
     return sqlite3.connect(DB_NAME)
 
 def init_db():
-    """Initialise la structure de la base de données."""
+    """Initialise une structure de base de données professionnelle."""
     conn = get_db_connection()
     cursor = conn.cursor()
     
-    # Table Instruments
+    # 1. Instruments (Liste des actions)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS instruments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            symbol TEXT NOT NULL UNIQUE,
-            name TEXT
+            symbol TEXT PRIMARY KEY,
+            name TEXT,
+            sector TEXT,
+            last_dividend REAL DEFAULT 0.0,
+            last_dividend_year INTEGER DEFAULT 0
         )
     """)
     
-    # Table Historique
+    # 2. Historique des Cours (OHLCV)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS historical_quotes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            instrument_id INTEGER,
-            Date TEXT,
-            "Dernier_cours" REAL,
-            "Volume" REAL,
-            UNIQUE(instrument_id, Date)
+            symbol TEXT,
+            date TEXT,
+            close REAL,
+            volume REAL,
+            UNIQUE(symbol, date)
         )
     """)
+
+    # 3. Portefeuille (Ce que vous possédez)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS portfolio (
+            symbol TEXT PRIMARY KEY,
+            quantity INTEGER DEFAULT 0,
+            avg_price REAL DEFAULT 0.0, -- Prix de revient unitaire (PRU)
+            total_invested REAL DEFAULT 0.0
+        )
+    """)
+
+    # 4. Transactions (Journal de bord)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT,
+            type TEXT, -- ACHAT / VENTE / DIVIDENDE
+            symbol TEXT,
+            quantity INTEGER,
+            price REAL,
+            total_amount REAL
+        )
+    """)
+    
     conn.commit()
     conn.close()
 
-def get_latest_session_date():
-    """Récupère la dernière date enregistrée en base."""
+def get_latest_date():
     conn = get_db_connection()
     try:
-        row = conn.execute("SELECT MAX(Date) FROM historical_quotes").fetchone()
+        row = conn.execute("SELECT MAX(date) FROM historical_quotes").fetchone()
         return row[0] if row and row[0] else None
-    except Exception:
+    except:
         return None
     finally:
         conn.close()
 
+# --- 3. MOTEUR D'ACQUISITION (SCRAPING & DATA) ---
+
 def clean_number(txt):
-    """Nettoie les formats numériques (virgules, espaces, tirets)."""
     if not txt: return 0.0
-    clean = str(txt).replace(' ', '').replace('%', '').replace(',', '.')
-    if '--' in clean or clean in ['-', '']: return 0.0
-    try:
-        return float(clean)
-    except Exception:
-        return 0.0
+    clean = str(txt).replace(' ', '').replace('%', '').replace(',', '.').replace(u'\xa0', '')
+    try: return float(clean)
+    except: return 0.0
 
-# --- 3. MOTEUR D'ACQUISITION (SCRAPING INTELLIGENT) ---
-
-def sync_instruments():
-    """Synchronise la liste des actions."""
+def sync_instruments_and_dividends():
+    """
+    Récupère la liste des actions et essaie d'estimer/scrapper les dividendes.
+    Note: Le scraping précis des dividendes sur le web marocain est complexe car les URL changent.
+    Ici, nous simulons une mise à jour via une 'Knowledge Base' initiale pour les actions connues,
+    mais le code est prêt pour scrapper une source externe.
+    """
+    print("🌍 Synchronisation des instruments...")
     try:
         df = cb.get_available_instrument()
-        # On ne garde que les tickers à 3 lettres (Actions standards)
-        df_actions = df[df["Symbole"].astype(str).str.len() == 3].copy()
+        # Filtrer pour ne garder que les actions (Ticker < 6 chars généralement)
+        df_actions = df[df["Symbole"].astype(str).str.len() <= 3].copy()
     except Exception as e:
-        print(f"⚠️ Erreur récupération instruments: {e}")
+        print(f"⚠️ Erreur API Bourse: {e}")
         return []
 
     conn = get_db_connection()
-    instruments = []
     
+    # Dictionnaire de secours pour les dividendes 2023/2024 (Pour éviter le hardcoding pur dans la logique)
+    # Dans une version idéale, on ferait un requests.get('site_bourse/dividendes') et un BeautifulSoup
+    known_dividends = {
+        'IAM': 2.19, 'BCP': 9.5, 'ATW': 15.5, 'CIM': 55.0, 'LHM': 66.0, 
+        'MSA': 8.5, 'COS': 8.5, 'TQM': 38.0, 'SID': 0.0, 'ADH': 0.0
+    }
+
+    instruments_list = []
     for _, row in df_actions.iterrows():
         sym = str(row["Symbole"]).strip()
-        if sym in BLACKLIST: continue
+        name = str(row["Nom"]).strip()
         
-        name = str(row["Nom"]).strip() if "Nom" in row else sym
+        # Mise à jour des dividendes connus (ou 0 par défaut)
+        div = known_dividends.get(sym, 0.0)
+        year = 2023 if sym in known_dividends else 0
         
-        # Mise à jour ou Insertion
-        conn.execute("INSERT OR IGNORE INTO instruments (symbol, name) VALUES (?, ?)", (sym, name))
+        conn.execute("""
+            INSERT INTO instruments (symbol, name, last_dividend, last_dividend_year) 
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(symbol) DO UPDATE SET 
+            name=excluded.name, 
+            last_dividend=CASE WHEN excluded.last_dividend > 0 THEN excluded.last_dividend ELSE last_dividend END
+        """, (sym, name, div, year))
         
-        # Récupérer l'ID
-        inst_id = conn.execute("SELECT id FROM instruments WHERE symbol = ?", (sym,)).fetchone()[0]
-        instruments.append({"id": inst_id, "symbol": sym, "name": name})
+        instruments_list.append(sym)
         
     conn.commit()
     conn.close()
-    return instruments
+    return instruments_list
 
-def fetch_worker(inst, start_s, end_s):
-    """Fonction exécutée par les threads pour récupérer la data."""
-    sym = inst["symbol"]
+def fetch_history_worker(symbol, start_s, end_s):
+    """Worker pour le multithreading."""
     try:
-        df = cb.get_historical_data_auto(sym, start_s, end_s)
-        if df is None or df.empty or "Date" not in df.columns:
-            return None
-            
-        # Standardisation des colonnes
+        df = cb.get_historical_data_auto(symbol, start_s, end_s)
+        if df is None or df.empty or "Date" not in df.columns: return None
         df["Date"] = pd.to_datetime(df["Date"]).dt.strftime("%Y-%m-%d")
-        return (inst["id"], df)
-    except Exception:
-        return None
+        return (symbol, df)
+    except: return None
 
 def update_market_data():
-    """Orchestre la mise à jour (Delta + Multithreading)."""
-    print("🔄 Initialisation de la mise à jour...")
+    """Met à jour les cours."""
     init_db()
-    instruments = sync_instruments()
+    symbols = sync_instruments_and_dividends()
     
-    last_date = get_latest_session_date()
-    
-    # Définition de la fenêtre de tir
-    if last_date:
-        start_dt = datetime.datetime.strptime(last_date, "%Y-%m-%d").date() + timedelta(days=1)
-    else:
-        # Première initialisation : 2 ans d'historique suffisent pour la SMA200
-        start_dt = date.today() - timedelta(days=730)
-        print("🆕 Initialisation complète (2 ans d'historique).")
-
+    last_date = get_latest_date()
+    start_dt = datetime.datetime.strptime(last_date, "%Y-%m-%d").date() + timedelta(days=1) if last_date else date.today() - timedelta(days=730)
     end_dt = date.today()
-    
+
     if start_dt > end_dt:
-        print("✅ Base déjà à jour.")
+        print("✅ Données à jour.")
         return 0
 
-    print(f"📥 Téléchargement des données : {start_dt} -> {end_dt}")
-    start_s = start_dt.strftime("%Y-%m-%d")
-    end_s = end_dt.strftime("%Y-%m-%d")
+    print(f"📥 Téléchargement: {start_dt} -> {end_dt}")
+    start_s, end_s = start_dt.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d")
     
-    total_rows = 0
     conn = get_db_connection()
-    
+    count = 0
     with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = {executor.submit(fetch_worker, i, start_s, end_s): i for i in instruments}
-        
+        futures = {executor.submit(fetch_history_worker, s, start_s, end_s): s for s in symbols}
         for future in as_completed(futures):
             res = future.result()
             if res:
-                inst_id, df = res
+                sym, df = res
+                data_tuples = []
                 for _, row in df.iterrows():
-                    close = clean_number(row.get("Dernier cours", 0))
-                    vol = clean_number(row.get("Volume", 0))
-                    
-                    try:
-                        conn.execute("""
-                            INSERT OR IGNORE INTO historical_quotes (instrument_id, Date, "Dernier_cours", "Volume")
-                            VALUES (?, ?, ?, ?)
-                        """, (inst_id, row["Date"], close, vol))
-                        total_rows += 1
-                    except Exception:
-                        pass
+                    c = clean_number(row.get("Dernier cours", 0))
+                    v = clean_number(row.get("Volume", 0))
+                    data_tuples.append((sym, row["Date"], c, v))
+                
+                if data_tuples:
+                    conn.executemany("INSERT OR IGNORE INTO historical_quotes (symbol, date, close, volume) VALUES (?, ?, ?, ?)", data_tuples)
+                    count += len(data_tuples)
     
     conn.commit()
     conn.close()
-    print(f"✅ Mise à jour terminée. +{total_rows} nouvelles cotations.")
-    return total_rows
+    print(f"✅ +{count} nouvelles cotations.")
+    return count
 
-# --- 4. ANALYSE INVESTISSEUR (LE CERVEAU) ---
+# --- 4. LE CERVEAU (ANALYSE TECHNIQUE & FONDAMENTALE) ---
 
-def get_stock_history(symbol, conn, limit=300):
-    query = """
-        SELECT h.Date, h."Dernier_cours" as close, h."Volume" as volume
-        FROM historical_quotes h
-        JOIN instruments i ON h.instrument_id = i.id
-        WHERE i.symbol = ?
-        ORDER BY h.Date ASC
-    """ # Pas de LIMIT ici pour avoir tout l'historique pour la SMA200, on coupe après
-    try:
-        df = pd.read_sql_query(query, conn, params=(symbol,))
-        if not df.empty:
-            df['close'] = df['close'].apply(clean_number)
-            df['volume'] = df['volume'].apply(clean_number)
-            # On ne garde que la fin après nettoyage
-            return df.tail(limit).reset_index(drop=True)
-    except Exception:
-        pass
-    return pd.DataFrame()
-
-def analyze_portfolio():
-    """Analyse le marché pour trouver les opportunités DCA."""
-    session_date = get_latest_session_date()
-    if not session_date: return None
-
-    conn = get_db_connection()
-    # Récupérer tous les instruments actifs
-    instruments = conn.execute("SELECT symbol, name FROM instruments").fetchall()
+def get_data_for_analysis(conn, symbol, limit=300):
+    query = "SELECT date, close, volume FROM historical_quotes WHERE symbol = ? ORDER BY date ASC"
+    df = pd.read_sql_query(query, conn, params=(symbol,))
+    if df.empty: return pd.DataFrame()
     
-    analysis_results = []
-    market_trend_bullish = 0
-    total_analyzed = 0
+    # Calcul Indicateurs Techniques avec Pandas TA
+    df['SMA200'] = ta.sma(df['close'], length=200)
+    df['RSI'] = ta.rsi(df['close'], length=14)
+    return df.tail(limit) # On garde la fin
 
-    print(f"🧠 Analyse 'Bon Père de Famille' du {session_date}...")
+def get_portfolio_exposure(conn):
+    """Calcule la valeur totale et l'exposition par action."""
+    df = pd.read_sql_query("SELECT symbol, quantity, avg_price FROM portfolio WHERE quantity > 0", conn)
+    exposure = {}
+    total_value = 0.0
+    
+    # Il faut récupérer le prix actuel pour valoriser le portefeuille
+    current_prices = {}
+    for sym in df['symbol'].tolist():
+        row = conn.execute("SELECT close FROM historical_quotes WHERE symbol = ? ORDER BY date DESC LIMIT 1", (sym,)).fetchone()
+        if row: current_prices[sym] = row[0]
 
-    for symbol, name in instruments:
-        df = get_stock_history(symbol, conn)
-        if len(df) < 200: continue # Pas assez de données pour SMA200
+    for _, row in df.iterrows():
+        sym = row['symbol']
+        price = current_prices.get(sym, row['avg_price'])
+        val = row['quantity'] * price
+        exposure[sym] = val
+        total_value += val
+        
+    return total_value, exposure
+
+def analyze_market():
+    conn = get_db_connection()
+    today_str = datetime.date.today().strftime("%Y-%m-%d")
+    
+    # 1. Récupérer infos portefeuille
+    total_pf_value, pf_exposure = get_portfolio_exposure(conn)
+    cash_available = BUDGET_MENSUEL # On considère l'apport mensuel comme cash dispo immédiat
+    
+    # 2. Récupérer les instruments et dividendes
+    instruments = pd.read_sql_query("SELECT * FROM instruments", conn)
+    
+    opportunities = []
+    risks = []
+    
+    print("🧠 Analyse du marché en cours...")
+    
+    for _, stock in instruments.iterrows():
+        sym = stock['symbol']
+        df = get_data_for_analysis(conn, sym)
+        
+        if len(df) < 200: continue # Pas assez d'historique
         
         last = df.iloc[-1]
+        sma200 = last['SMA200']
+        rsi = last['RSI']
+        close = last['close']
         
-        # Filtre liquidité (si volume moyen < seuil, on ignore)
-        avg_volume = df['volume'].tail(20).mean()
-        if avg_volume < MIN_VOLUME_MAD: continue
-
-        total_analyzed += 1
-
-        # --- INDICATEURS CLÉS ---
-        # 1. Tendance Long Terme (SMA 200)
-        sma200 = df['close'].rolling(window=200).mean().iloc[-1]
-        trend = "HAUSSIER" if last['close'] > sma200 else "BAISSIER"
+        # --- CALCUL FONDAMENTAL ---
+        # Calcul du Yield (Rendement)
+        div_amount = stock['last_dividend']
+        yield_pct = (div_amount / close * 100) if close > 0 else 0
         
-        if trend == "HAUSSIER":
-            market_trend_bullish += 1
-
-        # 2. Performance Court Terme (Pour détecter le "Dip")
-        # Variation sur 1 semaine (5 séances)
-        price_1w_ago = df['close'].iloc[-6] if len(df) >= 6 else last['close']
-        perf_week = ((last['close'] - price_1w_ago) / price_1w_ago) * 100
-        
-        # 3. Stratégie de Notation (Score / 10)
+        # --- FILTRES STRATÉGIQUES ---
         score = 0
         reasons = []
-
-        # A. Priorité aux valeurs sûres (Whitelist)
-        if symbol in YIELD_STOCKS:
-            score += 3
-            reasons.append("💎 Valeur de Rendement")
-
-        # B. Tendance de fond obligatoire pour acheter
-        if trend == "HAUSSIER":
-            score += 3
-        else:
-            score -= 5 # On n'achète pas en tendance baissière
-
-        # C. "Buy the Dip" : Bonus si baisse récente dans une tendance haussière
-        if trend == "HAUSSIER" and -5.0 < perf_week < -1.0:
-            score += 2
-            reasons.append(f"📉 Soldes ({perf_week:.1f}% sur 1 sem)")
         
-        # D. Proximité SMA 200 (Point d'entrée idéal)
-        dist_sma = (last['close'] - sma200) / sma200
-        if 0 < dist_sma < 0.05: # Prix entre 0 et 5% au dessus de la SMA200
+        # A. Tendance de Fond (Sécurité)
+        if close > sma200:
             score += 2
-            reasons.append("⭐ Support SMA200 proche")
+        else:
+            score -= 5 # On évite la tendance baissière
+            
+        # B. Rendement (Objectif 10%)
+        if yield_pct >= MIN_YIELD:
+            score += 3
+            reasons.append(f"💰 Bon Rendement ({yield_pct:.2f}%)")
+        
+        # C. Timing (RSI) - Buy the Dip
+        if rsi < 40:
+            score += 2
+            reasons.append(f"📉 En survente (RSI {rsi:.0f})")
+        elif rsi > 70:
+            score -= 3 # Trop cher actuellement
+            
+        # D. Gestion Portefeuille
+        current_inv = pf_exposure.get(sym, 0)
+        proj_total = total_pf_value + cash_available
+        if proj_total > 0 and (current_inv / proj_total) > MAX_ALLOCATION_PER_STOCK:
+            score = -10 # On bloque, trop d'exposition
+            reasons.append("⛔ Exposition Max atteinte")
 
-        if score > 0:
-            analysis_results.append({
-                "symbol": symbol,
-                "name": name,
-                "close": last['close'],
-                "trend": trend,
-                "perf_week": perf_week,
-                "score": score,
-                "reasons": reasons
+        # Sélection finale
+        if score >= 4:
+            opportunities.append({
+                'symbol': sym,
+                'name': stock['name'],
+                'close': close,
+                'score': score,
+                'yield': yield_pct,
+                'reasons': reasons
             })
+            
+        # Détection de Risques (Crash)
+        prev_close = df.iloc[-2]['close']
+        var_day = ((close - prev_close)/prev_close)*100
+        if var_day < -4.0:
+            risks.append(f"🔻 {sym} a chuté de {var_day:.2f}% aujourd'hui.")
 
     conn.close()
     
-    # Calcul Météo Marché
-    bullish_ratio = (market_trend_bullish / total_analyzed) * 100 if total_analyzed > 0 else 0
-    market_status = "NEUTRE"
-    if bullish_ratio > 60: market_status = "🟢 HAUSSIER (Favorable)"
-    elif bullish_ratio < 40: market_status = "🔴 BAISSIER (Prudence)"
+    # Tri par score
+    opportunities.sort(key=lambda x: x['score'], reverse=True)
+    return opportunities[:3], risks, total_pf_value
 
-    # Tri des résultats (Meilleur score d'abord)
-    analysis_results.sort(key=lambda x: x['score'], reverse=True)
-    
-    return {
-        "date": session_date,
-        "market_status": market_status,
-        "bullish_pct": bullish_ratio,
-        "top_picks": analysis_results[:3], # Top 3 seulement
-        "risks": [res for res in analysis_results if res['perf_week'] < -10] # Alerte si crash > 10%
-    }
+# --- 5. RAPPORT & INTELLIGENCE TEMPORELLE ---
 
-# --- 5. NOTIFICATION & RAPPORT (L'INTERFACE) ---
-
-def generate_report(data):
-    """Génère un message Telegram lisible et orienté action."""
-    if not data: return "❌ Pas de données disponibles."
+def generate_report(opportunities, risks, pf_value, report_type):
+    today_fr = datetime.date.today().strftime("%d/%m/%Y")
     
-    date_report = datetime.datetime.strptime(data['date'], "%Y-%m-%d").strftime("%d/%m/%Y")
+    emojis = {"DAILY": "📅", "WEEKLY": "📆", "MONTHLY": "📊"}
+    title = f"{emojis.get(report_type, '📅')} **RAPPORT {report_type} - {today_fr}**"
     
-    # En-tête Météo
-    msg = [
-        f"📅 **CONSEIL INVESTISSEUR - {date_report}**",
-        f"🌍 **Météo Marché** : {data['market_status']}",
-        f"📊 {data['bullish_pct']:.0f}% des actions sont en tendance haussière.",
-        "",
-        f"💰 **Allocation du Mois ({BUDGET_MENSUEL:,.0f} MAD)**",
-        "Voici comment répartir votre apport aujourd'hui :"
-    ]
+    msg = [title, ""]
     
-    # Allocation DCA
-    budget_remaining = BUDGET_MENSUEL
+    # Section 1 : Opportunités du jour
+    msg.append(f"💡 **Top Opportunités (Budget: {BUDGET_MENSUEL} MAD)**")
     
-    if not data['top_picks']:
-        msg.append("😴 Rien d'intéressant aujourd'hui. Gardez votre cash.")
+    if not opportunities:
+        msg.append("😴 Marché incertain ou trop cher. Gardez votre cash.")
     else:
-        # Répartition simple : 60% Top 1, 40% Top 2 (ou 100% si un seul)
-        allocations = [0.6, 0.4] if len(data['top_picks']) >= 2 else [1.0]
-        
-        for i, stock in enumerate(data['top_picks']):
-            if i >= len(allocations): break
+        remaining_budget = BUDGET_MENSUEL
+        for op in opportunities:
+            # Allocation intelligente : 60% au 1er, 40% au 2ème
+            alloc_pct = 0.6 if op == opportunities[0] and len(opportunities)>1 else 0.4
+            # Si un seul choix, 100%
+            if len(opportunities) == 1: alloc_pct = 1.0
             
-            amount = BUDGET_MENSUEL * allocations[i]
-            qty = int(amount // stock['close'])
-            cost = qty * stock['close']
+            invest_amount = remaining_budget * alloc_pct
+            qty = int(invest_amount // op['close'])
             
             if qty > 0:
-                icon = "🥇" if i == 0 else "🥈"
-                reasons_str = ", ".join(stock['reasons'])
-                msg.append(
-                    f"\n{icon} **{stock['name']} ({stock['symbol']})**"
-                )
-                msg.append(f"   🛒 **Acheter {qty} actions** à {stock['close']} MAD")
-                msg.append(f"   💳 Total : {cost:,.0f} MAD")
-                msg.append(f"   💡 *Pourquoi ?* {reasons_str}")
-            
-            budget_remaining -= cost
-
-    # Alerte Risque
-    if data['risks']:
-        msg.append("\n⚠️ **Alertes Chute (>10%)**")
-        for r in data['risks'][:2]: # Max 2 alertes
-            msg.append(f"🔻 {r['symbol']}: {r['perf_week']:.1f}% sur 1 semaine.")
-
-    # Footer Technique
-    msg.append("\n------------------")
-    msg.append(f"🤖 *BotBourse v2.0* | Base à jour : {data['date']}")
+                cost = qty * op['close']
+                msg.append(f"\n🚀 **{op['name']} ({op['symbol']})**")
+                msg.append(f"   🎯 Acheter **{qty}** à {op['close']} MAD")
+                msg.append(f"   ℹ️ {', '.join(op['reasons'])}")
+                remaining_budget -= cost
     
+    # Section 2 : Risques
+    if risks:
+        msg.append("\n⚠️ **Alertes Marché**")
+        for r in risks: msg.append(r)
+        
+    # Section 3 : Spécifique Hebdo/Mensuel
+    if report_type == "MONTHLY":
+        msg.append("\n------------------")
+        msg.append("📈 **Bilan Mensuel**")
+        msg.append(f"💼 Valeur Portefeuille estimée : {pf_value:,.2f} MAD")
+        msg.append("✅ N'oubliez pas d'injecter votre épargne mensuelle.")
+        
+    msg.append("\n🤖 *BotBourse Pro v3.0*")
     return "\n".join(msg)
 
 def send_telegram(message):
-    print("\n📤 --- ENVOI TELEGRAM ---")
-    print(message) # Log console
-    
     if not BOT_TOKEN or not CHAT_ID:
-        print("⚠️ Pas de token Telegram configuré. Sortie console uniquement.")
+        print("MSG (Console):", message)
         return
-
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "Markdown"}
-    
     try:
-        r = requests.post(url, json=payload)
-        if r.status_code != 200:
-            print(f"❌ Erreur Telegram: {r.text}")
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        requests.post(url, json={"chat_id": CHAT_ID, "text": message, "parse_mode": "Markdown"})
     except Exception as e:
-        print(f"❌ Erreur connexion: {e}")
+        print(f"❌ Erreur Telegram: {e}")
 
-# --- 6. POINT D'ENTRÉE ---
+# --- 6. EXÉCUTION PRINCIPALE ---
 
 def main():
-    try:
-        # 1. Mise à jour des données
-        updated_rows = update_market_data()
+    # 1. Mise à jour des données
+    update_market_data()
+    
+    # 2. Détermination du type de rapport
+    today = datetime.date.today()
+    report_type = "DAILY"
+    
+    # Est-ce vendredi ? (0=Lundi, 4=Vendredi)
+    if today.weekday() == 4:
+        report_type = "WEEKLY"
+    
+    # Est-ce la fin du mois ? (Si demain on change de mois)
+    tomorrow = today + timedelta(days=1)
+    if tomorrow.month != today.month:
+        report_type = "MONTHLY"
         
-        # 2. Analyse Investissement
-        analysis = analyze_portfolio()
-        
-        # 3. Génération & Envoi Rapport
-        if analysis:
-            report = generate_report(analysis)
-            send_telegram(report)
-        else:
-            print("⚠️ Analyse impossible (pas de données récentes ?)")
-            
-    except Exception as e:
-        print(f"💥 ERREUR CRITIQUE: {e}")
-        # Optionnel : Notifier le crash
-        if BOT_TOKEN and CHAT_ID:
-            requests.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                json={"chat_id": CHAT_ID, "text": f"🚨 Crash Bot: {str(e)}"}
-            )
-        raise e
+    # 3. Analyse
+    opps, risks, pf_val = analyze_market()
+    
+    # 4. Envoi
+    if opps or risks or report_type != "DAILY":
+        report = generate_report(opps, risks, pf_val, report_type)
+        send_telegram(report)
+    else:
+        print("Rien à signaler aujourd'hui.")
 
 if __name__ == "__main__":
     main()
