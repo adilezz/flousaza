@@ -1,7 +1,10 @@
 casabourse>=0.1.0
-pandas<2.0.0
+pandas>=2.0.0
+# IMPORTANT : On bloque numpy en version 1.x car la v2.0 fait planter pandas_ta
+numpy<2.0.0
+# On installe pandas_ta directement depuis GitHub (version de développement)
+git+https://github.com/twopirllc/pandas-ta.git@development
 requests>=2.31.0
 beautifulsoup4>=4.12.0
 python-telegram-bot>=20.0
 matplotlib>=3.7.0
-pandas_ta==0.3.14b0
