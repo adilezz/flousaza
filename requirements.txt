@@ -1,7 +1,7 @@
 casabourse>=0.1.0
 pandas>=2.0.0
+pandas_ta>=0.3.14  # NOUVEAU: Pour le calcul facile du RSI/SMA
 requests>=2.31.0
-python-telegram-bot>=20.0  # Pour le futur bot sur Render
-matplotlib>=3.7.0          # Pour générer les graphiques
-mplfinance         # Pour les graphiques financiers (bougies)
-schedule>=1.2.0            # Pour la gestion des tâches sur Render
+beautifulsoup4>=4.12.0 # NOUVEAU: Pour scrapper les infos dividendes si besoin
+python-telegram-bot>=20.0
+matplotlib>=3.7.0
