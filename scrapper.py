@@ -8,7 +8,8 @@ from psycopg2.extras import execute_values
 from dotenv import load_dotenv
 
 # Charger les variables d'environnement (URL de votre base Supabase/Neon)
-DB_URL = "postgresql://postgres.naoagvvceeztbpcdpect:adilFG12345FIGUIG@aws-1-eu-west-1.pooler.supabase.com:5432/postgres"
+load_dotenv()
+DB_URL = "postgresql://postgres.mcebgjgnkbhesttmrrst:adilFG12345FIGUIG@aws-1-eu-west-1.pooler.supabase.com:5432/postgres"
 
 # --- 1. LE SCHÉMA SQL VALIDÉ ---
 SCHEMA_SQL = """
@@ -17,9 +18,9 @@ SCHEMA_SQL = """
 
 -- 1. Référentiel
 CREATE TABLE IF NOT EXISTS instruments (
-    symbol VARCHAR(10) PRIMARY KEY,
-    name VARCHAR(100),
-    sector VARCHAR(50),
+    symbol TEXT PRIMARY KEY,
+    name TEXT,
+    sector TEXT,
     is_active BOOLEAN DEFAULT TRUE,
     quality_score INTEGER DEFAULT 50, -- Note par défaut neutre
     created_at TIMESTAMP DEFAULT NOW()
@@ -27,15 +28,15 @@ CREATE TABLE IF NOT EXISTS instruments (
 
 -- 2. Configuration
 CREATE TABLE IF NOT EXISTS strategy_config (
-    key VARCHAR(50) PRIMARY KEY,
-    value VARCHAR(50),
+    key TEXT PRIMARY KEY,
+    value TEXT,
     description TEXT
 );
 
 -- 3. Données de Marché
 CREATE TABLE IF NOT EXISTS market_data (
     id SERIAL PRIMARY KEY,
-    symbol VARCHAR(10) REFERENCES instruments(symbol),
+    symbol TEXT REFERENCES instruments(symbol),
     date DATE NOT NULL,
     open NUMERIC(10, 2),
     high NUMERIC(10, 2),
@@ -48,9 +49,9 @@ CREATE TABLE IF NOT EXISTS market_data (
 -- 4. Intelligence Financière (Fondamentaux)
 CREATE TABLE IF NOT EXISTS company_financials (
     id SERIAL PRIMARY KEY,
-    symbol VARCHAR(10) REFERENCES instruments(symbol),
+    symbol TEXT REFERENCES instruments(symbol),
     year INT NOT NULL,
-    period VARCHAR(10) DEFAULT 'ANNUAL',
+    period TEXT DEFAULT 'ANNUAL',
     net_income NUMERIC(20, 2),
     equity NUMERIC(20, 2),
     revenue NUMERIC(20, 2),
@@ -64,37 +65,27 @@ CREATE TABLE IF NOT EXISTS company_financials (
 -- 5. Dividendes (Corporate Actions)
 CREATE TABLE IF NOT EXISTS corporate_actions (
     id SERIAL PRIMARY KEY,
-    symbol VARCHAR(10) REFERENCES instruments(symbol),
+    symbol TEXT REFERENCES instruments(symbol),
     fiscal_year INT,
     amount NUMERIC(10, 2),
     ex_date DATE,
     payment_date DATE,
-    type VARCHAR(20) DEFAULT 'Ordinary',
-    status VARCHAR(20) DEFAULT 'Proposed'
+    type TEXT DEFAULT 'Ordinary',
+    status TEXT DEFAULT 'Proposed'
 );
 
 -- 6. Portefeuille
 CREATE TABLE IF NOT EXISTS transactions (
     id SERIAL PRIMARY KEY,
     date TIMESTAMP DEFAULT NOW(),
-    symbol VARCHAR(10) REFERENCES instruments(symbol),
-    type VARCHAR(20) NOT NULL, -- BUY, SELL, DIVIDEND, DEPOSIT
+    symbol TEXT REFERENCES instruments(symbol),
+    type TEXT NOT NULL, -- BUY, SELL, DIVIDEND, DEPOSIT
     quantity INT DEFAULT 0,
     price NUMERIC(10, 2) DEFAULT 0,
     fees NUMERIC(10, 2) DEFAULT 0,
     total_amount NUMERIC(12, 2),
     notes TEXT
 );
-
--- Vue Portefeuille Live
-CREATE OR REPLACE VIEW portfolio_live AS
-SELECT 
-    symbol,
-    SUM(CASE WHEN type = 'BUY' THEN quantity WHEN type = 'SELL' THEN -quantity ELSE 0 END) as qty,
-    SUM(CASE WHEN type = 'BUY' THEN total_amount ELSE 0 END) / NULLIF(SUM(CASE WHEN type = 'BUY' THEN quantity ELSE 0 END), 0) as avg_price
-FROM transactions
-GROUP BY symbol
-HAVING SUM(CASE WHEN type = 'BUY' THEN quantity WHEN type = 'SELL' THEN -quantity ELSE 0 END) > 0;
 """
 
 def get_db_connection():
@@ -130,7 +121,7 @@ def seed_instruments():
     for _, row in df_actions.iterrows():
         sym = str(row["Symbole"]).strip()
         name = str(row["Nom"]).strip()
-        sector = "Unknown" # Casabourse ne donne pas toujours le secteur directement ici
+        sector = str(row["Secteur"]).strip()
         instruments_to_insert.append((sym, name, sector))
 
     # Upsert (Insérer ou ne rien faire si existe)
